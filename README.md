@@ -45,9 +45,9 @@ This version of the beer game is open source and has a [Creative Commons license
 
 ## How to Start a Session
 
-I am currently hosting a version of this code [here](https://the-beer-game-37777398-4d5fb.web.app/). You can use it for teaching if you like.
+I am currently hosting a version of this code [here](https://beer-game-f65a8.web.app/). You can use it for teaching if you like.
 
-To host a game, you first need to log in as a host; it will ask you for a password, which is 'Sesame'. I know - not very secure, but enough for now. You can then create a new session with a Game ID. You can share this ID with students, who can then log in with this game ID and a Name. This can be any name, but they should remember it, since if they get disconnected from the game, they can always reconnect using the Game ID and their name as long as the session is still running.
+To host a game, you first need an instructor account: click "Request Instructor Access", register, and verify your email address. Once your application is approved you can sign in and create a new session with a Game ID. You can share this ID with students, who can then log in with this game ID and a Name. This can be any name, but they should remember it, since if they get disconnected from the game, they can always reconnect using the Game ID and their name as long as the session is still running.
 
 You can test this out yourself with multiple browser tabs.
 

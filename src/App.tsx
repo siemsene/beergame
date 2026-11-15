@@ -6,10 +6,12 @@ import PlayerJoin from "./components/PlayerJoin";
 import PlayerView from "./components/PlayerView";
 import AuthPortal from "./components/AuthPortal";
 import AdminDashboard from "./components/AdminDashboard";
+import CompleteApplication, { ApplicationDraft } from "./components/CompleteApplication";
 import titleBg from "./beergametitle.webp";
 import { auth, db } from "./firebase";
 import { ensureAdminProfile, syncEmailVerified } from "./api";
 import { InstructorProfile } from "./types/auth";
+import { describeFirebaseError } from "./utils/firebaseErrors";
 
 if (typeof document !== "undefined") {
   document.documentElement.style.setProperty(
@@ -34,14 +36,21 @@ const App: React.FC = () => {
   const [verifyBusy, setVerifyBusy] = useState(false);
   const [verifyMessage, setVerifyMessage] = useState<string | null>(null);
   const [verifyError, setVerifyError] = useState<string | null>(null);
+  // Registration spans an Auth sign-in (which unmounts AuthPortal) and a
+  // callable; App owns this state so the UI stays coherent across both steps.
+  const [registrationPending, setRegistrationPending] = useState(false);
+  const [registrationError, setRegistrationError] = useState<string | null>(null);
+  const [registrationDraft, setRegistrationDraft] = useState<ApplicationDraft | null>(null);
 
   useEffect(() => {
     const unsub = onAuthStateChanged(auth, (nextUser) => {
       setUser(nextUser);
       setAuthLoading(false);
+      setProfileError(null);
       if (!nextUser || nextUser.isAnonymous) {
         setProfile(null);
         setProfileLoading(false);
+        setRegistrationError(null);
       } else {
         setProfileLoading(true);
       }
@@ -56,9 +65,9 @@ const App: React.FC = () => {
 
     let cancelled = false;
 
+    // Only bootstraps the admin's own profile; failures must not block other users.
     ensureAdminProfile().catch((err) => {
-      if (import.meta.env.DEV) console.error("ensureAdminProfile failed", err);
-      if (!cancelled) setProfileError("Failed to initialize instructor profile. Please reload the page.");
+      console.error("ensureAdminProfile failed", err);
     });
 
     const ref = doc(db, "instructors", user.uid);
@@ -77,10 +86,13 @@ const App: React.FC = () => {
         setProfileLoading(false);
       },
       (err) => {
-        if (import.meta.env.DEV) console.error(err);
+        console.error("instructor profile snapshot failed", err);
         if (!cancelled) {
           setProfile(null);
           setProfileLoading(false);
+          setProfileError(
+            "Unable to load your instructor profile. Please reload the page or sign out and back in."
+          );
         }
       }
     );
@@ -97,9 +109,13 @@ const App: React.FC = () => {
     if (!user || !needsEmailVerification || !user.emailVerified) {
       return;
     }
-    syncEmailVerified().catch((err) => {
-      if (import.meta.env.DEV) console.error("syncEmailVerified failed", err);
-    });
+    // Force a token refresh so the server sees the up-to-date verification state.
+    user
+      .getIdToken(true)
+      .then(() => syncEmailVerified())
+      .catch((err) => {
+        console.error("syncEmailVerified failed", err);
+      });
   }, [user, needsEmailVerification]);
 
   const onCheckVerified = async () => {
@@ -111,17 +127,20 @@ const App: React.FC = () => {
     setVerifyMessage(null);
     try {
       await auth.currentUser.reload();
-      const refreshed = auth.currentUser;
-      setUser(refreshed);
-      if (refreshed?.emailVerified) {
-        await syncEmailVerified();
+      // reload() does not refresh the ID token; the server reads email_verified
+      // from the Auth record, but refresh anyway so client claims match.
+      await auth.currentUser.getIdToken(true);
+      const result = await syncEmailVerified();
+      if (result.emailVerified) {
         setVerifyMessage("Email verified. Your application is now visible to admins for review.");
       } else {
         setVerifyError("Email is not verified yet. Please click the link in the verification email.");
       }
     } catch (err) {
-      if (import.meta.env.DEV) console.error(err);
-      setVerifyError("Unable to refresh verification status. Try again in a moment.");
+      console.error("verification check failed", err);
+      setVerifyError(
+        describeFirebaseError(err, "Unable to refresh verification status. Try again in a moment.")
+      );
     } finally {
       setVerifyBusy(false);
     }
@@ -138,8 +157,10 @@ const App: React.FC = () => {
       await sendEmailVerification(auth.currentUser);
       setVerifyMessage("Verification email resent. Check your inbox (and spam folder).");
     } catch (err) {
-      if (import.meta.env.DEV) console.error(err);
-      setVerifyError("Unable to resend verification email. Try again in a moment.");
+      console.error("resend verification failed", err);
+      setVerifyError(
+        describeFirebaseError(err, "Unable to resend verification email. Try again in a moment.")
+      );
     } finally {
       setVerifyBusy(false);
     }
@@ -163,21 +184,33 @@ const App: React.FC = () => {
     }
 
     if (!user || user.isAnonymous) {
-      return <AuthPortal initialMode={authLandingMode} />;
+      return (
+        <AuthPortal
+          initialMode={authLandingMode}
+          onRegistrationStart={(draft) => {
+            setRegistrationDraft(draft);
+            setRegistrationError(null);
+            setRegistrationPending(true);
+          }}
+          onRegistrationFinished={(error) => {
+            setRegistrationPending(false);
+            setRegistrationError(error);
+          }}
+        />
+      );
     }
 
     if (!profile) {
+      if (registrationPending) {
+        return <div className="panel">Submitting your application...</div>;
+      }
       return (
-        <div className="panel">
-          <h2>Account profile missing</h2>
-          <p>
-            This account is authenticated but does not have an instructor profile yet. Register as
-            a new instructor from this screen or sign out and use a different account.
-          </p>
-          <button className="btn-subtle" onClick={() => signOut(auth)}>
-            Sign out
-          </button>
-        </div>
+        <CompleteApplication
+          key={user.uid}
+          user={user}
+          draft={registrationDraft}
+          initialError={registrationError}
+        />
       );
     }
 
@@ -335,6 +368,9 @@ const App: React.FC = () => {
     profile,
     profileError,
     profileLoading,
+    registrationDraft,
+    registrationError,
+    registrationPending,
     user,
     verifyBusy,
     verifyError,

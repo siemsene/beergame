@@ -40,12 +40,12 @@ const syncEmailVerifiedFn = httpsCallable<
 
 const adminReviewInstructorFn = httpsCallable<
   { instructorUid: string; decision: "approve" | "reject" },
-  { status: string }
+  { status: string; emailSent?: boolean }
 >(functions, "adminReviewInstructor");
 
 const adminRevokeInstructorFn = httpsCallable<
   { instructorUid: string },
-  { status: string }
+  { status: string; emailSent?: boolean }
 >(functions, "adminRevokeInstructor");
 
 const adminDeleteInstructorFn = httpsCallable<

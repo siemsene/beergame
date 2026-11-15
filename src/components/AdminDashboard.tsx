@@ -3,6 +3,9 @@ import { collection, limit, onSnapshot, orderBy, query } from "firebase/firestor
 import { db } from "../firebase";
 import { adminDeleteInstructor, adminReviewInstructor, adminRevokeInstructor } from "../api";
 import { InstructorProfile, InstructorStatus } from "../types/auth";
+import { describeFirebaseError } from "../utils/firebaseErrors";
+
+const DIRECTORY_LIMIT = 500;
 
 interface InstructorRow extends InstructorProfile {
   uid: string;
@@ -24,7 +27,7 @@ const AdminDashboard: React.FC = () => {
   const [sortDirection, setSortDirection] = useState<SortDirection>("desc");
 
   React.useEffect(() => {
-    const q = query(collection(db, "instructors"), orderBy("createdAt", "desc"), limit(100));
+    const q = query(collection(db, "instructors"), orderBy("createdAt", "desc"), limit(DIRECTORY_LIMIT));
     const unsub = onSnapshot(
       q,
       (snap) => {
@@ -39,8 +42,8 @@ const AdminDashboard: React.FC = () => {
         setLoading(false);
       },
       (err) => {
-        if (import.meta.env.DEV) console.error(err);
-        setAlert({ tone: "error", message: "Failed to load instructors." });
+        console.error("instructor list snapshot failed", err);
+        setAlert({ tone: "error", message: describeFirebaseError(err, "Failed to load instructors.") });
         setLoading(false);
       }
     );
@@ -48,10 +51,7 @@ const AdminDashboard: React.FC = () => {
     return unsub;
   }, []);
 
-  const pending = useMemo(
-    () => rows.filter((r) => r.status === "pending" && r.emailVerified !== false),
-    [rows]
-  );
+  const pending = useMemo(() => rows.filter((r) => r.status === "pending"), [rows]);
   const unverifiedPendingCount = useMemo(
     () => rows.filter((r) => r.status === "pending" && r.emailVerified === false).length,
     [rows]
@@ -61,20 +61,27 @@ const AdminDashboard: React.FC = () => {
     () => rows.filter((r) => r.status === "rejected" || r.status === "revoked").length,
     [rows]
   );
-  const pendingCount = pending.length;
+  const pendingCount = pending.length - unverifiedPendingCount;
 
   const onReview = async (uid: string, decision: "approve" | "reject") => {
     setBusyUid(uid);
     setAlert(null);
     try {
-      await adminReviewInstructor({ instructorUid: uid, decision });
+      const result = await adminReviewInstructor({ instructorUid: uid, decision });
+      const verb = decision === "approve" ? "approved" : "rejected";
       setAlert({
         tone: "success",
-        message: `Application ${decision === "approve" ? "approved" : "rejected"} successfully.`,
+        message:
+          result.emailSent === false
+            ? `Application ${verb}, but the notification email could not be sent. Please let the instructor know directly.`
+            : `Application ${verb} successfully.`,
       });
     } catch (err) {
-      if (import.meta.env.DEV) console.error(err);
-      setAlert({ tone: "error", message: "Unable to update application status." });
+      console.error("adminReviewInstructor failed", err);
+      setAlert({
+        tone: "error",
+        message: describeFirebaseError(err, "Unable to update application status."),
+      });
     } finally {
       setBusyUid(null);
     }
@@ -92,11 +99,17 @@ const AdminDashboard: React.FC = () => {
     setBusyUid(uid);
     setAlert(null);
     try {
-      await adminRevokeInstructor({ instructorUid: uid });
-      setAlert({ tone: "success", message: "Instructor access revoked." });
+      const result = await adminRevokeInstructor({ instructorUid: uid });
+      setAlert({
+        tone: "success",
+        message:
+          result.emailSent === false
+            ? "Instructor access revoked, but the notification email could not be sent."
+            : "Instructor access revoked.",
+      });
     } catch (err) {
-      if (import.meta.env.DEV) console.error(err);
-      setAlert({ tone: "error", message: "Unable to revoke instructor." });
+      console.error("adminRevokeInstructor failed", err);
+      setAlert({ tone: "error", message: describeFirebaseError(err, "Unable to revoke instructor.") });
     } finally {
       setBusyUid(null);
     }
@@ -105,7 +118,7 @@ const AdminDashboard: React.FC = () => {
   const onDelete = async (uid: string) => {
     if (
       !window.confirm(
-        "Permanently delete this rejected instructor? This removes the profile and the sign-in account."
+        "Permanently delete this instructor? This removes the profile and the sign-in account."
       )
     ) {
       return;
@@ -115,10 +128,10 @@ const AdminDashboard: React.FC = () => {
     setAlert(null);
     try {
       await adminDeleteInstructor({ instructorUid: uid });
-      setAlert({ tone: "success", message: "Rejected instructor deleted." });
+      setAlert({ tone: "success", message: "Instructor deleted." });
     } catch (err) {
-      if (import.meta.env.DEV) console.error(err);
-      setAlert({ tone: "error", message: "Unable to delete instructor." });
+      console.error("adminDeleteInstructor failed", err);
+      setAlert({ tone: "error", message: describeFirebaseError(err, "Unable to delete instructor.") });
     } finally {
       setBusyUid(null);
     }
@@ -166,6 +179,11 @@ const AdminDashboard: React.FC = () => {
             <p>Review instructor applications and monitor usage in one place.</p>
           </div>
         </div>
+        {rows.length >= DIRECTORY_LIMIT && (
+          <div className="alert alert-error">
+            Showing the {DIRECTORY_LIMIT} most recent profiles only; counts below may be incomplete.
+          </div>
+        )}
         <div className="metric-grid">
           <article className="metric-card">
             <strong>{pendingCount}</strong>
@@ -196,7 +214,7 @@ const AdminDashboard: React.FC = () => {
             <h3>Pending Reviews</h3>
             <p>Applications waiting for an admin decision.</p>
           </div>
-          <span className="chip chip-pending">{pendingCount} pending</span>
+          <span className="chip chip-pending">{pending.length} pending</span>
         </div>
 
         {pending.length === 0 ? (
@@ -207,6 +225,13 @@ const AdminDashboard: React.FC = () => {
               <article key={row.uid} className="item-card">
                 <h4>{row.name}</h4>
                 <p className="item-card-meta">{row.email}</p>
+                {row.emailVerified === false && (
+                  <p className="item-card-meta">
+                    <span className="chip chip-pending">email not verified</span>{" "}
+                    Approving re-checks verification and only succeeds once the applicant has
+                    clicked their verification link.
+                  </p>
+                )}
                 <p className="item-card-meta">
                   {row.institution} - {row.country}
                 </p>
@@ -336,6 +361,29 @@ const AdminDashboard: React.FC = () => {
                       <td className="num">{sessions}</td>
                       <td className="num">{players}</td>
                       <td>
+                        {row.role !== "admin" &&
+                          (row.status === "pending" ||
+                            row.status === "rejected" ||
+                            row.status === "revoked") && (
+                            <button
+                              type="button"
+                              className="btn-primary"
+                              disabled={busyUid === row.uid}
+                              onClick={() => onReview(row.uid, "approve")}
+                            >
+                              {row.status === "revoked" ? "Restore" : "Approve"}
+                            </button>
+                          )}{" "}
+                        {row.role !== "admin" && row.status === "pending" && (
+                          <button
+                            type="button"
+                            className="btn-danger"
+                            disabled={busyUid === row.uid}
+                            onClick={() => onReview(row.uid, "reject")}
+                          >
+                            Reject
+                          </button>
+                        )}
                         {row.role !== "admin" && row.status === "approved" && (
                           <button
                             type="button"
@@ -346,7 +394,8 @@ const AdminDashboard: React.FC = () => {
                             Revoke
                           </button>
                         )}
-                        {row.role !== "admin" && row.status === "rejected" && (
+                        {row.role !== "admin" &&
+                          (row.status === "rejected" || row.status === "revoked") && (
                           <button
                             type="button"
                             className="btn-danger"
@@ -356,10 +405,7 @@ const AdminDashboard: React.FC = () => {
                             Delete
                           </button>
                         )}
-                        {(row.role === "admin" ||
-                          (row.status !== "approved" && row.status !== "rejected")) && (
-                          <span className="text-muted">-</span>
-                        )}
+                        {row.role === "admin" && <span className="text-muted">-</span>}
                       </td>
                     </tr>
                   );

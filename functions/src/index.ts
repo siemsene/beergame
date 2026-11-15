@@ -250,6 +250,58 @@ async function sendEmail(params: {
   }
 }
 
+/** Sends an email but never throws: notification failures must not fail the caller's action. */
+async function trySendEmail(params: Parameters<typeof sendEmail>[0]): Promise<boolean> {
+  try {
+    await sendEmail(params);
+    return true;
+  } catch (err) {
+    logger.error("Email send failed", { to: params.to, subject: params.subject, err });
+    return false;
+  }
+}
+
+function escapeHtml(raw: string): string {
+  return raw
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;")
+    .replace(/'/g, "&#39;");
+}
+
+async function notifyAdminOfApplication(profile: {
+  name: string;
+  email: string;
+  institution: string;
+  country: string;
+}) {
+  const appUrl = APP_BASE_URL.value();
+  const emailText = [
+    "New Beer Game instructor application received (email verified).",
+    `Name: ${profile.name}`,
+    `Email: ${profile.email}`,
+    `Institution: ${profile.institution}`,
+    `Country: ${profile.country}`,
+    "",
+    `Review in app: ${appUrl}`,
+  ].join("\n");
+
+  await trySendEmail({
+    to: [ADMIN_EMAIL.value()],
+    subject: "Beer Game: New instructor application",
+    text: emailText,
+    html: `<p>${escapeHtml(emailText).replace(/\n/g, "<br />")}</p>`,
+  });
+}
+
+function isAdminEmailUser(user: admin.auth.UserRecord): boolean {
+  const adminEmail = ADMIN_EMAIL.value().trim().toLowerCase();
+  // Require a verified email so nobody can claim admin by registering the
+  // admin address before the owner does.
+  return Boolean(adminEmail) && user.email?.toLowerCase() === adminEmail && user.emailVerified;
+}
+
 async function setAuthClaims(uid: string, role: UserRole | null, status: InstructorStatus | null) {
   if (!role || !status) {
     await admin.auth().setCustomUserClaims(uid, null);
@@ -282,9 +334,7 @@ export const ensureAdminProfile = onCall(
   async (request) => {
     const uid = requireAuthUid(request);
     const user = await admin.auth().getUser(uid);
-    const email = user.email?.toLowerCase();
-    const adminEmail = ADMIN_EMAIL.value().toLowerCase();
-    if (!email || email !== adminEmail) {
+    if (!isAdminEmailUser(user)) {
       return { created: false };
     }
 
@@ -332,12 +382,36 @@ export const submitInstructorApplication = onCall(
       throw new HttpsError("failed-precondition", "User email is required.");
     }
 
-    const adminEmail = ADMIN_EMAIL.value().toLowerCase();
-    const isAdmin = user.email.toLowerCase() === adminEmail;
+    const profileRef = db.collection("instructors").doc(uid);
+    const existingSnap = await profileRef.get();
+    const existing = existingSnap.exists ? (existingSnap.data() as InstructorDoc) : null;
+
+    if (existing && (existing.status === "approved" || existing.status === "revoked")) {
+      // Never let a re-submission reset an approved/revoked account.
+      return { status: existing.status, role: existing.role };
+    }
+
+    if (existing && existing.status === "pending") {
+      // Allow correcting details on a pending application without resetting it.
+      await profileRef.set(
+        {
+          name,
+          institution,
+          country,
+          emailVerified: existing.emailVerified === true || user.emailVerified,
+        },
+        { merge: true }
+      );
+      return { status: existing.status, role: existing.role };
+    }
+
+    // New application, or re-application after a rejection.
+    const isAdmin = isAdminEmailUser(user);
     const role: UserRole = isAdmin ? "admin" : "instructor";
     const status: InstructorStatus = isAdmin ? "approved" : "pending";
+    const emailVerified = isAdmin ? true : Boolean(user.emailVerified);
 
-    await db.collection("instructors").doc(uid).set(
+    await profileRef.set(
       {
         email: user.email,
         name,
@@ -345,17 +419,23 @@ export const submitInstructorApplication = onCall(
         country,
         role,
         status,
-        emailVerified: isAdmin ? true : Boolean(user.emailVerified),
+        emailVerified,
         reviewedBy: isAdmin ? uid : null,
         reviewedAt: isAdmin ? admin.firestore.FieldValue.serverTimestamp() : null,
         createdAt: admin.firestore.FieldValue.serverTimestamp(),
-        sessionsCreatedCount: 0,
-        playersJoinedCount: 0,
+        sessionsCreatedCount: existing?.sessionsCreatedCount ?? 0,
+        playersJoinedCount: existing?.playersJoinedCount ?? 0,
       },
       { merge: true }
     );
 
     await setAuthClaims(uid, role, status);
+
+    // If the email is already verified (e.g. completing an application after
+    // verifying), syncEmailVerified will not send the notification, so send it now.
+    if (!isAdmin && emailVerified) {
+      await notifyAdminOfApplication({ name, email: user.email, institution, country });
+    }
 
     return { status, role };
   }
@@ -365,11 +445,10 @@ export const syncEmailVerified = onCall(
   { enforceAppCheck: true, maxInstances: 100, secrets: [ADMIN_EMAIL, SMTP2GO_API_KEY, MAIL_FROM, APP_BASE_URL] },
   async (request) => {
     const uid = requireAuthUid(request);
-    const tokenVerified = Boolean(
-      (request.auth?.token as Record<string, unknown> | undefined)?.email_verified
-    );
-
-    if (!tokenVerified) {
+    // Read the Auth record rather than the ID token: the token's
+    // email_verified claim stays stale until the client force-refreshes it.
+    const user = await admin.auth().getUser(uid);
+    if (!user.emailVerified) {
       return { emailVerified: false };
     }
 
@@ -387,23 +466,7 @@ export const syncEmailVerified = onCall(
     await profileRef.set({ emailVerified: true }, { merge: true });
 
     if (profile.role === "instructor" && profile.status === "pending") {
-      const appUrl = APP_BASE_URL.value();
-      const emailText = [
-        "New Beer Game instructor application received (email verified).",
-        `Name: ${profile.name}`,
-        `Email: ${profile.email}`,
-        `Institution: ${profile.institution}`,
-        `Country: ${profile.country}`,
-        "",
-        `Review in app: ${appUrl}`,
-      ].join("\n");
-
-      await sendEmail({
-        to: [ADMIN_EMAIL.value()],
-        subject: "Beer Game: New instructor application",
-        text: emailText,
-        html: `<p>${emailText.replace(/\n/g, "<br />")}</p>`,
-      });
+      await notifyAdminOfApplication(profile);
     }
 
     return { emailVerified: true };
@@ -434,11 +497,22 @@ export const adminReviewInstructor = onCall(
     if (instructorData.role === "admin") {
       throw new HttpsError("failed-precondition", "Admin account cannot be reviewed.");
     }
-    if (decision === "approve" && instructorData.emailVerified === false) {
-      throw new HttpsError(
-        "failed-precondition",
-        "Cannot approve an instructor whose email has not been verified."
-      );
+    if (decision === "approve" && instructorData.emailVerified !== true) {
+      // The profile flag can lag behind Auth (the user verified but never
+      // returned to the app), so check the Auth record directly.
+      let authVerified = false;
+      try {
+        authVerified = (await admin.auth().getUser(instructorUid)).emailVerified;
+      } catch (err) {
+        logger.warn("Could not load auth user during review", { instructorUid, err });
+      }
+      if (!authVerified) {
+        throw new HttpsError(
+          "failed-precondition",
+          "Cannot approve: this instructor has not verified their email address yet."
+        );
+      }
+      await instructorRef.set({ emailVerified: true }, { merge: true });
     }
 
     const nextStatus: InstructorStatus = decision === "approve" ? "approved" : "rejected";
@@ -461,7 +535,7 @@ export const adminReviewInstructor = onCall(
 
     const appUrl = APP_BASE_URL.value();
     const verdict = decision === "approve" ? "approved" : "rejected";
-    await sendEmail({
+    const emailSent = await trySendEmail({
       to: [instructorData.email],
       subject: `Beer Game instructor application ${verdict}`,
       text:
@@ -474,7 +548,7 @@ export const adminReviewInstructor = onCall(
           : "<p>Your instructor access request was not approved.</p>",
     });
 
-    return { status: nextStatus };
+    return { status: nextStatus, emailSent };
   }
 );
 
@@ -513,14 +587,14 @@ export const adminRevokeInstructor = onCall(
     await admin.auth().updateUser(instructorUid, { disabled: true });
     await setAuthClaims(instructorUid, "instructor", "revoked");
 
-    await sendEmail({
+    const emailSent = await trySendEmail({
       to: [instructorData.email],
       subject: "Beer Game instructor access revoked",
       text: "Your instructor access has been revoked by the administrator.",
       html: "<p>Your instructor access has been revoked by the administrator.</p>",
     });
 
-    return { status: "revoked" };
+    return { status: "revoked", emailSent };
   }
 );
 
@@ -544,10 +618,10 @@ export const adminDeleteInstructor = onCall({ enforceAppCheck: true, maxInstance
   if (instructorData.role === "admin") {
     throw new HttpsError("failed-precondition", "Admin account cannot be deleted.");
   }
-  if (instructorData.status !== "rejected") {
+  if (instructorData.status !== "rejected" && instructorData.status !== "revoked") {
     throw new HttpsError(
       "failed-precondition",
-      "Only rejected instructors can be deleted."
+      "Only rejected or revoked instructors can be deleted."
     );
   }
 

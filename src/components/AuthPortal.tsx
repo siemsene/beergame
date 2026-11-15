@@ -7,14 +7,24 @@ import {
 } from "firebase/auth";
 import { auth } from "../firebase";
 import { submitInstructorApplication } from "../api";
+import { describeFirebaseError } from "../utils/firebaseErrors";
+import type { ApplicationDraft } from "./CompleteApplication";
 
 type AuthMode = "login" | "register" | "reset";
 
 interface AuthPortalProps {
   initialMode?: AuthMode;
+  /** Called before the account is created; the portal unmounts once Auth signs the user in. */
+  onRegistrationStart?: (draft: ApplicationDraft) => void;
+  /** Called when registration ends. `error` is set only if the account exists but the application failed. */
+  onRegistrationFinished?: (error: string | null) => void;
 }
 
-const AuthPortal: React.FC<AuthPortalProps> = ({ initialMode = "login" }) => {
+const AuthPortal: React.FC<AuthPortalProps> = ({
+  initialMode = "login",
+  onRegistrationStart,
+  onRegistrationFinished,
+}) => {
   const [mode, setMode] = useState<AuthMode>(initialMode);
   const [email, setEmail] = useState("");
   const [password, setPassword] = useState("");
@@ -48,8 +58,8 @@ const AuthPortal: React.FC<AuthPortalProps> = ({ initialMode = "login" }) => {
       await signInWithEmailAndPassword(auth, email.trim(), password);
       setMessage("Signed in.");
     } catch (err) {
-      if (import.meta.env.DEV) console.error(err);
-      setError("Unable to sign in. Check your email and password.");
+      console.error("signIn failed", err);
+      setError(describeFirebaseError(err, "Unable to sign in. Check your email and password."));
     } finally {
       setLoading(false);
     }
@@ -59,24 +69,36 @@ const AuthPortal: React.FC<AuthPortalProps> = ({ initialMode = "login" }) => {
     e.preventDefault();
     resetFeedback();
     setLoading(true);
+    const draft: ApplicationDraft = {
+      name: name.trim(),
+      institution: institution.trim(),
+      country: country.trim(),
+    };
+    let accountCreated = false;
+    onRegistrationStart?.(draft);
     try {
       const credential = await createUserWithEmailAndPassword(auth, email.trim(), password);
-      await submitInstructorApplication({
-        name: name.trim(),
-        institution: institution.trim(),
-        country: country.trim(),
-      });
+      accountCreated = true;
+      await submitInstructorApplication(draft);
       try {
         await sendEmailVerification(credential.user);
       } catch (verifyErr) {
-        if (import.meta.env.DEV) console.error("sendEmailVerification failed", verifyErr);
+        console.error("sendEmailVerification failed", verifyErr);
       }
+      onRegistrationFinished?.(null);
       setMessage(
         "Application submitted. We've sent a verification link to your email — please verify it before your application can be reviewed."
       );
     } catch (err) {
-      if (import.meta.env.DEV) console.error(err);
-      setError("Unable to complete registration. Verify your details and try again.");
+      console.error("registration failed", err);
+      const msg = describeFirebaseError(
+        err,
+        accountCreated
+          ? "Your account was created, but submitting the application failed. Please try submitting it again."
+          : "Unable to complete registration."
+      );
+      onRegistrationFinished?.(accountCreated ? msg : null);
+      setError(msg);
     } finally {
       setLoading(false);
     }
@@ -90,8 +112,8 @@ const AuthPortal: React.FC<AuthPortalProps> = ({ initialMode = "login" }) => {
       await sendPasswordResetEmail(auth, email.trim());
       setMessage("Password reset email sent.");
     } catch (err) {
-      if (import.meta.env.DEV) console.error(err);
-      setError("Unable to send reset email.");
+      console.error("password reset failed", err);
+      setError(describeFirebaseError(err, "Unable to send reset email."));
     } finally {
       setLoading(false);
     }
